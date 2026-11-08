@@ -13,6 +13,34 @@ from urllib.parse import urlsplit
 import jwt
 from jwt import PyJWKClient
 import uvicorn
+from starlette.routing import Mount, Route
+
+
+class _ASGIEndpoint:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        await self.app(scope, receive, send)
+
+
+def mcp_http_app(mcp):
+    """Serve the advertised MCP path directly with the pinned MCP 1.9.2 SDK.
+
+    That SDK mounts the handler at /mcp, which redirects /mcp to /mcp/.
+    An exact ASGI route avoids redirects while retaining the SDK lifespan.
+    """
+    app = mcp.streamable_http_app()
+    path = mcp.settings.streamable_http_path
+    for index, route in enumerate(app.router.routes):
+        if isinstance(route, Mount) and route.path == path:
+            endpoint = _ASGIEndpoint(route.app)
+            app.router.routes[index:index + 1] = [
+                Route(path, endpoint=endpoint),
+                Route(path.rstrip('/') + '/', endpoint=endpoint),
+            ]
+            break
+    return app
 
 
 def _json_response(status, payload, extra_headers=()):
@@ -88,5 +116,5 @@ def run_http(mcp):
     resource = os.getenv("MCP_PUBLIC_URL", "")
     if issuer and not resource:
         raise SystemExit("MCP_PUBLIC_URL is required when AUTH0_ISSUER is set")
-    app = protected_http(mcp.streamable_http_app(), token, issuer, audience, resource)
+    app = protected_http(mcp_http_app(mcp), token, issuer, audience, resource)
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
