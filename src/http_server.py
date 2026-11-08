@@ -7,13 +7,17 @@ OAuth client registration and authorization-code/PKCE happen at Auth0, not here.
 import asyncio
 import hmac
 import json
+import logging
 import os
+import uuid
 from urllib.parse import urlsplit
 
 import jwt
 from jwt import PyJWKClient
 import uvicorn
 from starlette.routing import Mount, Route
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class _ASGIEndpoint:
@@ -81,6 +85,7 @@ def protected_http(app, legacy_token, issuer="", audience="", resource=""):
             return
         authorization = dict(scope.get("headers", [])).get(b"authorization", b"")
         valid = hmac.compare_digest(authorization, ("Bearer " + legacy_token).encode())
+        auth_result = "legacy_ok" if valid else "missing_or_unsupported_authorization"
         if not valid and issuer and authorization.startswith(b"Bearer "):
             try:
                 raw = authorization[7:].decode("ascii")
@@ -91,18 +96,48 @@ def protected_http(app, legacy_token, issuer="", audience="", resource=""):
                     options={"require": ["exp", "iss", "aud"]},
                 )
                 valid = True
-            except (jwt.PyJWTError, ValueError, UnicodeError):
+                auth_result = "oauth_ok"
+            except (jwt.PyJWTError, ValueError, UnicodeError) as exc:
                 valid = False
-            except Exception:
+                auth_result = type(exc).__name__
+            except Exception as exc:
                 # Fail closed if Auth0 JWKS cannot be reached.
                 valid = False
+                auth_result = type(exc).__name__
         if not valid:
+            logger.info("MCP_DIAG auth=%s status=401", auth_result)
             headers = []
             if issuer:
                 headers.append((b"www-authenticate", ('Bearer resource_metadata="' + resource.rsplit("/mcp", 1)[0] + metadata_path + '"').encode()))
             await _json_response(401, {"error": "unauthorized"}, headers)(send)
             return
-        await app(scope, receive, send)
+        request_id = uuid.uuid4().hex[:8]
+        body = bytearray()
+        rpc_method = "unknown"
+
+        async def diagnostic_receive():
+            nonlocal rpc_method
+            message = await receive()
+            if message["type"] == "http.request":
+                chunk = message.get("body", b"")
+                if len(body) <= 8192:
+                    body.extend(chunk[:8193 - len(body)])
+                if not message.get("more_body", False) and len(body) <= 8192:
+                    try:
+                        payload = json.loads(body)
+                        method = payload.get("method") if isinstance(payload, dict) else None
+                        if method in {"initialize", "notifications/initialized", "tools/list", "tools/call", "ping", "resources/list", "prompts/list"}:
+                            rpc_method = method
+                    except (ValueError, UnicodeError):
+                        pass
+            return message
+
+        async def diagnostic_send(message):
+            if message["type"] == "http.response.start":
+                logger.info("MCP_DIAG id=%s auth=%s rpc=%s status=%s", request_id, auth_result, rpc_method, message["status"])
+            await send(message)
+
+        await app(scope, diagnostic_receive, diagnostic_send)
 
     return guarded
 
